@@ -1,0 +1,103 @@
+type: interndata_a1
+
+# ── Cleaned view of InternData-A1 ───────────────────────────────────────────
+# Symlink view, not a copy (~45 MB): data/ and meta/episodes point at
+#   /mnt/data/wangyuran/pretrain_dataset/interndata-A1
+# deletions live in each bucket's meta/excluded_episodes.json, and head/tail
+# motionless trimming is applied at load time from trim.csv below.
+#   244 buckets · 404,978 episodes · 2,510.2 h (86.4% of the raw 2,904.3 h)
+#   270,695,414 windows at the num_frames/stride below
+dataset_dir: /mnt/data/wangyuran/pretrain_dataset/interndata-A1-clean
+
+# meta/stats_<embodiment>.json lives inside the view, so the default
+# (stats_root = dataset_dir) is correct. Only set this if the mount is
+# read-only and you generated the stats elsewhere.
+stats_root: null
+
+# ★ REQUIRED with this dataset_dir, not optional.
+# The shipped stats were generated WITH this trim list, and the reader refuses
+# a stats file whose `population.trim_active` disagrees with how it is
+# configured. Leaving this null against these stats fails at startup with
+# "computed with a trim list but this reader is not".
+trim_csv: /mnt/data/wangyuran/pretrain_dataset/interndata-A1-clean/trim.csv
+
+# ── Window / stride ─────────────────────────────────────────────────────────
+# Matches robocoin.yaml / robotwin so mixture batches collate without a
+# per-source resize. 33 frames, stride 4 -> 9 video frames per sample.
+# Constraint: (num_frames - 1) % video_stride == 0
+#             (num_video_frames - 1) % 4 == 0   (Wan VAE temporal axis)
+num_frames: 33
+video_stride: 4
+window_stride: 1
+
+# ── Image size ──────────────────────────────────────────────────────────────
+# multiview=true -> L-shape canvas: top 256H×320W (head) + bottom-left
+#   128H×160W (left wrist) + bottom-right 128H×160W (right wrist).
+#   height MUST be 384 and width MUST be 320.
+height: 384
+width: 320
+multiview: true
+
+# ── Split ───────────────────────────────────────────────────────────────────
+# Every A1 bucket ships splits: {"train": "0:N"}, so split=val yields 0
+# windows unless you author a val partition first. Normalization stats are
+# always train-derived; a val reader loads the same file.
+split: train
+
+# ── Pose-frame contract ────────────────────────────────────────────────────
+# action/state use *_ee_to_robot_pose: the rigid arm-side attachment/controller
+# endpoint before the task TCP, in the robot frame shared by both arms. It is
+# not always a literal flange (e.g. Panda uses panda_hand); per embodiment it is
+# the published hand base / last arm link / gripper mount that the simulator
+# tracks. Native *_tcp_to_robot_pose is deliberately unused because AgiBotWorld
+# only publishes flange poses; the active mixture contract requires one rigid,
+# gripper-independent terminal-arm frame rather than a universal task TCP.
+
+# ── Video augmentation ──────────────────────────────────────────────────────
+# Same random factors across a clip (temporal consistency), TRAIN split only.
+# Worth keeping on: the sim renders already randomize lighting per episode and
+# several split_aloha articulation scenes are very dark.
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0
+
+# ── Action normalization ────────────────────────────────────────────────────
+# Per-embodiment (franka / lift2 / genie1 / split_aloha) because gripper units
+# differ per robot AND a single bucket often holds one gripper at a constant.
+# Every source position is first divided by its full-open stroke, yielding the
+# shared raw aperture convention 0=fully closed, 1=fully open. Quantile
+# normalization consequently preserves direction as -1=closed, +1=open.
+# 542,200,784 action+state rows pooled over 244/244 buckets after exclusions
+# and trim.csv were applied. Regenerate with the same population contract via:
+#   python -m openwam.dataloader.utils.stats_computation.interndata_a1_stats_computation \
+#       --dataset_dir /mnt/data/wangyuran/pretrain_dataset/interndata-A1-clean \
+#       --stats_root /mnt/data/wangyuran/pretrain_dataset/interndata-A1-clean \
+#       --trim_csv /mnt/data/wangyuran/pretrain_dataset/interndata-A1-clean/trim.csv \
+#       --min_keep 2 --split train
+# rot6d stats are identity-pinned, so action/state rot6d pass through unchanged
+# under every normalization mode.
+#   null / "none" -> off      "min-max" / "z-score" / "quantile" (default)
+normalize_mode: quantile
+
+enable_action_supervision: true
+
+# ── Unified 80-D action space (cross-robot shared head) ─────────────────────
+# The reader emits 20-D EEF
+#   [L_xyz(0:3), L_rot6d(3:9), L_grip(9), R_xyz(10:13), R_rot6d(13:19), R_grip(19)]
+# scattered into left 0-9 / right 34-43 — the same map RoboCOIN uses, so A1
+# mixes with it under one action head.
+# NOTE: with this on, action_dim is 80 — every other source in the mixture
+# must also set unify_action=true.
+unify_action: true
+unify_action_map: ["0-9", "34-43"]
+
+# ── Data budget ─────────────────────────────────────────────────────────────
+# null -> every bucket in full. A positive float water-fills a subsample of
+# episodes across buckets so effective post-exclusion/post-trim footage is
+# ~total_hours (seeded by project.seed).
+# The uncapped filtered population has 271,100,392 valid raw frames
+# but InternData-A1 receives an explicit 30% of the fixed 518,049,648-frame
+# budget: 155,414,894 frames = 1439.026796296296 h at 30 fps.
+total_hours: 1439.026796296296

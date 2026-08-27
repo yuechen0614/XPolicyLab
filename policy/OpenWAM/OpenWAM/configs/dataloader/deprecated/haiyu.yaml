@@ -1,0 +1,90 @@
+type: haiyu
+# ── Dataset root ────────────────────────────────────────────────────────────
+# Root directory containing 87,801 source-video subdirs (`<md5>_<start>_<end>/`),
+# each a self-contained multi-episode LeRobot v3 dataset (egocentric human-hand,
+# robot_type "ego_hand"): one concatenated ego mp4 + one concatenated parquet,
+# holding ~1–57 episodes located by per-episode video-frame offset.
+#
+# Unlike EgoDex/Ego4D this reader is a bespoke FLAT reader: it scans the root
+# once into a small cached per-episode manifest (see `manifest_path`) and builds
+# a single flat window index over all episodes, instead of instantiating 87k
+# heavyweight bucket readers. Samples are byte-identical to the EgoDex contract.
+dataset_dir: /mnt/data/wangyuran/Haiyu
+
+# ── Manifest cache ──────────────────────────────────────────────────────────
+# On first use the reader scans every subdir (reads each episodes parquet) and
+# writes a manifest of (dir, episode_index, length, prompt, video offsets).
+# Subsequent runs load it instantly. Default location (camera-keyed, so changing
+# target_camera never reuses another camera's offsets):
+#   {dataset_dir}/_openwam_haiyu_manifest_v1_{sanitized_target_camera}.parquet
+# Override `manifest_path` to store it elsewhere (e.g. a scratch dir if the
+# dataset dir is read-only); an explicit path is still camera-validated via the
+# manifest's stamped metadata (rebuilds on a target_camera change). Set
+# `rebuild_manifest: true` to force a rescan (e.g. after the dataset changes).
+manifest_path: null
+rebuild_manifest: false
+
+# ── Window / stride ─────────────────────────────────────────────────────────
+# num_frames + video_stride match RoboCOIN / EgoDex so mixture batches collate
+# without per-source resize. (33 frames, stride 4 → 9 video frames per sample.)
+num_frames: 33
+video_stride: 4
+window_stride: 1
+
+# ── Image size ──────────────────────────────────────────────────────────────
+# Source frames are mixed resolution (~91% 1920x1080, ~9% 1920x1680); every
+# frame is force-resized into its canvas slot, so the mix is a non-issue.
+# When multiview=true: height MUST be 384 and width MUST be 320. Keep aligned
+# with the other sub-datasets in mixture.yaml.
+height: 384
+width: 320
+
+# ── Camera ──────────────────────────────────────────────────────────────────
+target_camera: observation.images.ego
+
+# ── Multiview ──────────────────────────────────────────────────────────────
+# multiview: true → L-shape canvas at (384, 320):
+#     top    256H × 320W → ego camera (BILINEAR-stretched to slot)
+#     bot-L  128H × 160W → BLACK (Haiyu has no left wrist camera)
+#     bot-R  128H × 160W → BLACK (Haiyu has no right wrist camera)
+multiview: true
+camera_layout: [observation.images.ego, __missing_left__, __missing_right__]
+
+# ── Train / val split ───────────────────────────────────────────────────────
+# Pretraining-only: split=train uses all episodes; val is empty.
+split: train
+# seed comes from project.seed in train.yaml (injected at launch); ctor default 42.
+
+# ── Video augmentation ──────────────────────────────────────────────────────
+# Load-time color jitter with the SAME random factors across a clip's frames
+# (temporal consistency), TRAIN split only. Omit / null / false → disabled.
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0
+
+# ── Unified action space ────────────────────────────────────────────────────
+# unify_action=true widens the emitted action/proprio to the shared 80-D unified
+# space (UNIFY_DIM) so Haiyu batches collate with the other mixture sources whose
+# head is 80-D. Haiyu's action/proprio stay all-zero with all-False masks
+# (video-only supervision), so every dim is masked out of the loss.
+unify_action: true
+
+# ── Data budget (optional) ──────────────────────────────────────────────────
+# total_hours: cap raw video footage used for training, in hours. null / unset
+# (default) → use the full dataset. A positive float subsamples episodes (seeded
+# by project.seed) so total raw duration is ~total_hours.
+total_hours: null
+
+# ── Notes on what this reader does ──────────────────────────────────────────
+#  * Prompt: the fine-grained per-episode English instruction from each episode's
+#    meta/episodes tasks cell (describes the actual clip segment), NOT the coarse
+#    meta/tasks.parquet category label.
+#  * Action loss is intentionally disabled. The reader emits
+#      action = zeros(T-1, 80), action_mask = zeros(T-1, 80, bool),
+#      proprio = zeros(1, 80),  proprio_mask = zeros(1, 80, bool).
+#    Haiyu's per-frame payload is human MANO hand pose (not a robot action), so
+#    only video / image-prediction loss is supervised (same contract as EgoDex).
+#  * Bad-episode exclusion: {dataset_dir}/_openwam_haiyu_excluded.json (written
+#    by scripts/scan_dataset.py) lists {dir: [episode_index, ...]} to skip.

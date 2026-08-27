@@ -1,0 +1,79 @@
+# SG H200 image probe — wuji-ego-pretrain:v0.0.3 stack inventory
+# 1 node 1 GPU, ~5 min. No data mount, no repo, just inspects what's installed.
+
+JobName: wuji-ego-pretrain-v003-probe-sg
+JobType: PyTorchJob
+Region: ap-southeast-1
+WorkspaceId: "284761"
+ResourceId: quotaj421vuo8uwx
+JobMaxRunningTimeMinutes: 15
+Priority: 1
+JobSpecs:
+  - Type: Worker
+    PodCount: 1
+    Image: wuji-acr-sg-registry-vpc.ap-southeast-1.cr.aliyuncs.com/gpu/wuji-ego-pretrain:v0.0.3
+    ResourceConfig:
+      CPU: "8"
+      Memory: "32Gi"
+      SharedMemory: "32Gi"
+      GPU: "1"
+UserVpc:
+  VpcId: vpc-t4ncl4lgv4jgk9sqzbu16
+  SwitchId: vsw-t4n2ts4s2ljc0l5x68e7e
+  SecurityGroupId: sg-t4n8prl64zugz5i1yebu
+  DefaultRoute: eth0
+DataSources:
+  - Uri: bmcpfs://cpfs-07001v48jdw7tt8jhw0df-vpc-1xh1pi.ap-southeast-1.cpfs.aliyuncs.com/
+    MountPath: /cpfs/
+UserCommand: |
+  bash -c '
+  set -uo pipefail
+  echo "=== ENV ==="
+  hostname; date
+  cat /etc/os-release 2>/dev/null | head -3
+  echo PATH=$PATH
+  echo
+  echo "=== ALL PYTHON CANDIDATES ==="
+  for p in python python3 python3.10 python3.11 python3.12 python3.13; do
+      if command -v $p >/dev/null 2>&1; then
+          path=$(command -v $p)
+          ver=$($p --version 2>&1)
+          echo "  PATH:$p -> $path ($ver)"
+      fi
+  done
+  find /opt /usr/local /root /miniconda* /miniforge* /opt/conda -maxdepth 4 -name "python3*" -type f -executable 2>/dev/null | sort -u | head -10
+  echo
+  echo "=== STACK on default python ==="
+  python - <<PY
+  import importlib, importlib.metadata as md, sys
+  pkgs = [
+      "torch", "torchvision", "transformers", "accelerate", "peft",
+      "timm", "av", "hydra-core", "omegaconf", "wandb",
+      "pyarrow", "pandas", "numpy", "scipy", "opencv-python",
+      "huggingface_hub", "safetensors", "datasets", "einops",
+      "sentencepiece", "scikit-image", "ftfy",
+  ]
+  mod_map = {"opencv-python": "cv2", "hydra-core": "hydra", "scikit-image": "skimage"}
+  print(f"  python = {sys.executable} {sys.version.split()[0]}")
+  for p in pkgs:
+      mod = mod_map.get(p, p.replace("-", "_"))
+      try:
+          importlib.import_module(mod)
+          print(f"  OK   {p:<22s} {md.version(p)}")
+      except Exception as e:
+          print(f"  MISS {p:<22s} {type(e).__name__}: {str(e)[:80]}")
+  PY
+  echo
+  echo "=== TORCH GPU ==="
+  python -c "import torch; print(f\"torch={torch.__version__} cuda={torch.version.cuda} gpu={torch.cuda.device_count()} name={torch.cuda.get_device_name(0)}\"); x=torch.randn(8,8,device=\"cuda\"); print(f\"matmul ok sum={(x@x.T).sum().item():.4f}\")"
+  echo
+  echo "=== SG cpfs status ==="
+  ls /cpfs/ 2>/dev/null | head
+  ls /cpfs/egoscale/processed/ 2>/dev/null | head
+  echo "  lerobot_epic (old per-episode):"
+  ls /cpfs/egoscale/processed/lerobot/lerobot_epic 2>/dev/null | head -3
+  echo "  lerobotv3_hf (new chunk layout if repacked):"
+  ls /cpfs/egoscale/processed/lerobotv3_hf/ 2>/dev/null | head
+  echo
+  echo "=== DONE ==="
+  '

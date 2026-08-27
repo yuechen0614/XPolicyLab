@@ -1,0 +1,103 @@
+# Sub-source fields (including total_hours) are inherited from
+# configs/dataloader/<name>.yaml via Hydra defaults; mixture.yaml only carries
+# per-source enabled/weight + mixture-level knobs (type, weight_strategy).
+#
+# Override any inherited field by listing it under datasets.<name>, e.g.
+#   datasets.<name>.normalize_mode: null
+#   datasets.<name>.total_hours: 300.0
+#
+# Add a new dataset:
+#   1) register the class in openwam/dataloader/registry.py
+#   2) write configs/dataloader/<name>.yaml for standalone use
+#   3) here, add `<name>@datasets.<name>` to defaults and a per-source entry
+#      under `datasets:` with enabled/weight
+
+# CLI overrides (name-keyed; stable across reorderings):
+#   bash scripts/train.sh dataloader=mixture
+#   bash scripts/train.sh dataloader=mixture training.debug=true
+#   bash scripts/train.sh dataloader=mixture dataloader.weight_strategy=proportional
+#   bash scripts/train.sh dataloader=mixture dataloader.datasets.<name>.weight=0.5
+#   bash scripts/train.sh dataloader=mixture dataloader.datasets.<name>.enabled=false
+#   bash scripts/train.sh dataloader=mixture dataloader.datasets.worldengine.total_hours=300
+
+defaults:
+  # The user-facing name "agiworld" corresponds to the registered
+  # ``agibotworld`` reader/config in this repository.
+  - worldengine@datasets.worldengine
+  - agibotworld@datasets.agibotworld
+  - robocoin@datasets.robocoin
+  - oxe_droid@datasets.oxe_droid
+  - interndata_a1@datasets.interndata_a1
+  - _self_
+
+type: mixture
+
+# weight_strategy:
+#   manual         - use each sub-entry's `weight` field
+#   uniform        - each enabled source contributes equal virtual samples
+#   inverse_size   - w ∝ 1/(N × num_frames): favors small/short-window sources
+#   proportional   - w ∝ N: each real sample visited exactly once (full coverage)
+weight_strategy: proportional
+
+# Under `proportional` each enabled source is sampled ∝ its final window count
+# (w_i ∝ N_i; see mixture.py) — every real window is visited once per epoch, and
+# the per-source `weight:` below is INERT (it only takes effect under `manual`).
+#
+# Raw-frame budget measured 2026-08-06 after split/exclusion/trim filters. The
+# former 6000 h allocation represents 518,049,648 raw frames at the source FPS.
+# WorldEngine and InternData-A1 each receive 30%; the remaining 40% is split in
+# proportion to the uncapped valid frames of Agi/RoboCOIN/DROID. Largest-
+# remainder integer rounding keeps the target-frame total exact:
+#                     uncapped frames   target share   target frames   target hours
+#   worldengine          744,892,735      30.000000%     155,414,894   1439.026796296296
+#   agibotworld          123,175,420      18.698024%      96,865,050   1793.797222222222
+#   robocoin              94,228,074      14.303818%      74,100,881    686.119268518518
+#   oxe_droid             46,101,178       6.998157%      36,253,929   1007.053583333333
+#   interndata_a1        271,100,392      30.000000%     155,414,894   1439.026796296296
+#   total              1,279,497,799     100.000000%     518,049,648   6365.023666666665
+#
+# The target hours do not sum to 6000 because the invariant is the integer
+# 518,049,648-frame budget and source FPS differ. Complete episode selection can
+# slightly overshoot each target. Since `weight_strategy` remains proportional,
+# final training shares follow realized window counts and only approximate these
+# raw-frame targets; the per-source `weight:` values below remain inert.
+# At project.seed=42 the resulting whole-episode selection was verified as:
+#                     realized frames   final windows   epoch window share
+#   worldengine           155,726,026     155,666,126       30.0885%
+#   agibotworld            96,870,029      96,114,212       18.5778%
+#   robocoin               74,134,873      74,134,873       14.3294%
+#   oxe_droid              36,253,943      36,253,943        7.0075%
+#   interndata_a1         155,467,482     155,192,342       29.9969%
+#   total                 518,452,353     517,361,496      100.0000%
+# The 402,705-frame (+0.0777%) target overshoot is whole-episode discretization.
+# ⚠ `_build_index_map` stores two int32 values per virtual sample, so the
+# final map needs 4.139 GB decimal / 3.855 GiB per process
+# plus several full-size construction/permutation buffers. Rebuilding it in
+# `set_epoch()` incurs the same large transient allocation. Reduce a source's
+# `total_hours` and/or increase window_stride if the per-rank memory plan cannot
+# accommodate it.
+# To rebalance generally: set `weight_strategy: manual` and tune each `weight`,
+# cap a source via its `total_hours`, or flip `enabled`.
+
+datasets:
+  worldengine:
+    enabled: true
+    weight: 1.0
+
+  # AgiBotWorld-Beta (called "agiworld" in the request).
+  agibotworld:
+    enabled: true
+    weight: 1.0
+
+  robocoin:
+    enabled: true
+    weight: 1.0
+
+  # DROID: proportional auto-weighting by len() balances it against robocoin.
+  oxe_droid:
+    enabled: true
+    weight: 1.0
+
+  interndata_a1:
+    enabled: true
+    weight: 1.0

@@ -1,0 +1,36 @@
+name: CI - PR Pipeline
+
+# 所有 PR 自动触发：规范检查
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, edited]
+
+jobs:
+  convention-check:
+    name: PR Convention Check
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - name: Check PR title (Conventional Commits)
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if echo "$PR_TITLE" | grep -qiE '^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\(.+\))?!?:'; then
+            echo "✅ PR 标题格式正确"
+          else
+            echo "❌ PR 标题不符合 Conventional Commits 规范"
+            echo "期望格式: type(scope): description"
+            echo "示例: feat(detection): add grasp pose estimation module"
+            exit 1
+          fi
+
+      - name: Check work item reference
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if echo "$PR_BODY" | grep -qiE '(Resolve[sd]?\s+[mf]-[0-9]+|[A-Z]+-[0-9]+)'; then
+            echo "✅ 已关联工作项"
+          else
+            echo "⚠️ 建议在 PR 描述中添加 Resolve m-xxx 或 Resolve f-xxx"
+          fi

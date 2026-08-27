@@ -1,0 +1,44 @@
+type: robodojo
+
+# Formal layout only:
+#   <dataset_dir>/<task>/<embodiment>/data/episode_*.hdf5
+# dataset_variant=real keeps the recorded per-arm base EEF pose unchanged.
+dataset_dir: /mnt/data/wangyuran/OpenWAM/data/RoboDojo
+dataset_variant: sim            # sim: env/world -> arm base; real: native pose
+split: train
+
+embodiment: arx_x5              # real: arx_x5, piper, piper_x; sim: arx_x5
+action_mode: eef                 # only supported mode; raw representation is EEF20
+
+# Stats are discovered/generated under <dataset_dir>/meta/ for this variant
+# and embodiment. An explicit normalization_stats_path remains an API override.
+normalize_mode: min-max          # min-max, z-score, quantile, or null
+
+# Raw EEF20 is normalized first, then scattered into the shared 80-D layout:
+# left [xyz3, rot6d6, grip1] -> 0:10; right -> 34:44.
+unify_action: true
+unify_action_map: ["0-9", "34-43"]
+
+# State/action remain at the raw frame rate. video_stride affects video only.
+num_frames: 33
+video_stride: 4
+window_stride: 1
+repeat: 1
+val_ratio: 0.0
+seed: 42
+
+# Three source streams are assembled with the repository L-shape helper.
+height: 384
+width: 320
+multiview: true
+camera_layout: [cam_head, cam_left_wrist, cam_right_wrist]
+target_camera: cam_head
+
+# Load-time color jitter, using the same random factors across every frame in
+# one clip for temporal consistency. Applied to the assembled view on train
+# only; set to null or false to disable.
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0

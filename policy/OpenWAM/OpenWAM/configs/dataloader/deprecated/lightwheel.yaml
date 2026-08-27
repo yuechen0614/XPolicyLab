@@ -1,0 +1,92 @@
+type: lightwheel
+# ── Dataset root ────────────────────────────────────────────────────────────
+# Root directory of a two-level tree:
+#     lightwheel/<Task Name>/<uuid>/{data,videos,meta}
+# ~1,070 task dirs, 20,181 <uuid> episode dirs total. Each <uuid> is a
+# SINGLE-episode self-contained standard LeRobot v3 dataset (egocentric
+# human-hand, robot_type "ego_hand"): one ego mp4 + one per-frame parquet + its
+# own meta/. Uniform video resolution 1920x1456 h264 @30fps.
+#
+# Like Haiyu (and unlike EgoDex/Ego4D) this reader is a bespoke FLAT reader: it
+# scans the root once into a small cached per-episode manifest (see
+# `manifest_path`) and builds a single flat window index over all 20,181
+# episodes, instead of instantiating 20k heavyweight bucket readers. Samples are
+# byte-identical to the EgoDex / Haiyu video-only contract.
+dataset_dir: /mnt/data/wangyuran/lightwheel
+
+# ── Manifest cache ──────────────────────────────────────────────────────────
+# On first use the reader walks the two-level <Task>/<uuid> tree (reads each
+# leaf's episodes parquet) and writes a manifest of (dir, episode_index, length,
+# prompt, video offsets), where `dir` is the relative "<Task>/<uuid>" path.
+# Subsequent runs load it instantly. Default location:
+#   {dataset_dir}/_openwam_lightwheel_manifest_v1.parquet
+# Override `manifest_path` to store it elsewhere (e.g. a scratch dir if the
+# dataset dir is read-only). Set `rebuild_manifest: true` to force a rescan
+# (e.g. after the dataset contents change).
+manifest_path: null
+rebuild_manifest: false
+
+# ── Window / stride ─────────────────────────────────────────────────────────
+# num_frames + video_stride match RoboCOIN / EgoDex / Haiyu so mixture batches
+# collate without per-source resize. (33 frames, stride 4 → 9 video frames.)
+num_frames: 33
+video_stride: 4
+window_stride: 1
+
+# ── Image size ──────────────────────────────────────────────────────────────
+# Source frames are uniform 1920x1456; every frame is force-resized into its
+# canvas slot. When multiview=true: height MUST be 384 and width MUST be 320.
+# Keep aligned with the other sub-datasets in mixture.yaml.
+height: 384
+width: 320
+
+# ── Camera ──────────────────────────────────────────────────────────────────
+target_camera: observation.images.ego
+
+# ── Multiview ──────────────────────────────────────────────────────────────
+# multiview: true → L-shape canvas at (384, 320):
+#     top    256H × 320W → ego camera (BILINEAR-stretched to slot)
+#     bot-L  128H × 160W → BLACK (Lightwheel has no left wrist camera)
+#     bot-R  128H × 160W → BLACK (Lightwheel has no right wrist camera)
+multiview: true
+camera_layout: [observation.images.ego, __missing_left__, __missing_right__]
+
+# ── Train / val split ───────────────────────────────────────────────────────
+# Pretraining-only: split=train uses all episodes; val is empty.
+split: train
+# seed comes from project.seed in train.yaml (injected at launch); ctor default 42.
+
+# ── Video augmentation ──────────────────────────────────────────────────────
+# Load-time color jitter with the SAME random factors across a clip's frames
+# (temporal consistency), TRAIN split only. Omit / null / false → disabled.
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0
+
+# ── Unified action space ────────────────────────────────────────────────────
+# unify_action=true widens the emitted action/proprio to the shared 80-D unified
+# space (UNIFY_DIM) so Lightwheel batches collate with the other mixture sources
+# whose head is 80-D. Lightwheel's action/proprio stay all-zero with all-False
+# masks (video-only supervision), so every dim is masked out of the loss.
+unify_action: true
+
+# ── Data budget (optional) ──────────────────────────────────────────────────
+# total_hours: cap raw video footage used for training, in hours. null / unset
+# (default) → use the full dataset. A positive float subsamples episodes (seeded
+# by project.seed) so total raw duration is ~total_hours.
+total_hours: null
+
+# ── Notes on what this reader does ──────────────────────────────────────────
+#  * Prompt: the per-episode English instruction from each episode's
+#    meta/episodes tasks cell (equals the human-readable task name). Non-English
+#    prompts are dropped by an allowlist guard (expected ~0 drops).
+#  * Action loss is intentionally disabled. The reader emits
+#      action = zeros(T-1, 80), action_mask = zeros(T-1, 80, bool),
+#      proprio = zeros(1, 80),  proprio_mask = zeros(1, 80, bool).
+#    Lightwheel's per-frame payload is human MANO hand pose (not a robot action),
+#    so only video / image-prediction loss is supervised (same contract as EgoDex).
+#  * Bad-episode exclusion: {dataset_dir}/_openwam_lightwheel_excluded.json
+#    (written by scripts/scan_dataset.py or scripts/gpu_decode_scan.py) lists
+#    {dir: [episode_index, ...]} to skip.

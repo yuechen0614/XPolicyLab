@@ -1,0 +1,76 @@
+type: robocasa_gr1
+
+# Input must already contain simulator-backed EEF33 columns. The public NVIDIA
+# joint44 files do not; enrich them before running the re-indexer:
+#   python scripts/enrich_robocasa_gr1_joint44_to_eef33.py \
+#     --input /path/to/robocasa-gr1-v20 \
+#     --output /path/to/robocasa-gr1-eef33-v20
+#   python scripts/convert_robocasa_gr1_v20_to_v30.py \
+#     --input /path/to/robocasa-gr1-eef33-v20 \
+#     --output /path/to/robocasa-gr1-eef33-v30
+dataset_dir: /mnt/data/wangyuran/robocasa-gr1-eef33-lerobot-v3
+
+# Only EEF is supported. Raw EEF33:
+# [L xyz3+rot6d6+hand6, R xyz3+rot6d6+hand6, waist3].
+action_mode: eef
+eef_action_column: eef33_action
+eef_state_column: eef33_state
+
+# Native annotation.human.coarse_action is an integer class ID, not text.
+# Resolve task_index through converted meta/tasks.parquet. Missing/blank prompt
+# metadata is an error.
+prompt_columns: []
+
+# Camera key resolution by info.json features priority. Missing wrist views are
+# rendered as black slots in multiview mode.
+head_camera_priority:
+  - observation.images.ego_view
+  - observation.images.ego_view_rgb
+  - observation.images.ego_rgb
+  - observation.images.head_rgb
+  - observation.images.cam_head_rgb
+  - observation.images.cam_high_rgb
+left_wrist_camera_priority:
+  - observation.images.left_wrist
+  - observation.images.left_wrist_rgb
+  - observation.images.cam_left_wrist_rgb
+right_wrist_camera_priority:
+  - observation.images.right_wrist
+  - observation.images.right_wrist_rgb
+  - observation.images.cam_right_wrist_rgb
+
+num_frames: 33
+video_stride: 4
+window_stride: 1
+height: 384
+width: 320
+multiview: true
+split: train
+enable_action_supervision: true
+
+# min-max / z-score / quantile, or null to disable in-reader normalization.
+# The stats file location is fixed at <dataset_dir>/meta/normalization_stats.npy
+# and is auto-computed there on first use when missing (rank 0 scans the whole
+# root, other ranks wait) — every task bucket shares that one pooled file.
+# Delete it to force a rebuild; to build it up front:
+#   python -m openwam.dataloader.utils.stats_computation.robocasa_gr1_stats_computation \
+#     --config configs/dataloader/robocasa_gr1.yaml
+normalize_mode: min-max
+# Pose and waist dims pool action/state because they share physical units.
+# Fourier-hand actions are discrete commands while hand state is continuous
+# joint angle, so those 12 dims use directional `eef` / `eef_state` blocks.
+# Legacy action/state-pooled hand stats are rejected and rebuilt.
+
+# Normalize EEF33 first, then scatter arm poses, Fourier hands, and waist into
+# the shared EEF/dex-hand/reserved slots. Gripper slots 9/43 stay unmapped.
+# All 33 raw dims are simulator-backed and always valid, so no per-dim
+# state_mask/action_mask is needed; the unified mask marks unmapped slots false.
+unify_action: true
+unify_action_map: ["0-8", "10-15", "34-42", "44-49", "68-70"]
+
+# Load-time, temporally consistent augmentation (train split only).
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0
