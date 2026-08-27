@@ -1,0 +1,70 @@
+# SG OSS lerobot_epic layout probe
+# Mount cpfs + oss (DataSourceId d-1behmxymo477ld4v78 = wuji-sing/pretrain_processed_data/lerobot_epic)
+# Inspect: per-episode (60688 parquet+mp4) vs chunk-merged (~686 parquet+mp4) — drives whether
+# the LeRobot v3 reader can read it directly.
+
+JobName: sg-oss-lerobot-epic-layout-probe
+JobType: PyTorchJob
+Region: ap-southeast-1
+WorkspaceId: "284761"
+ResourceId: quotaj421vuo8uwx
+JobMaxRunningTimeMinutes: 10
+Priority: 1
+JobSpecs:
+  - Type: Worker
+    PodCount: 1
+    Image: wuji-acr-sg-registry-vpc.ap-southeast-1.cr.aliyuncs.com/gpu/wuji-ego-pretrain:v0.0.3
+    ResourceConfig:
+      CPU: "8"
+      Memory: "32Gi"
+      SharedMemory: "32Gi"
+      GPU: "1"
+UserVpc:
+  VpcId: vpc-t4ncl4lgv4jgk9sqzbu16
+  SwitchId: vsw-t4n2ts4s2ljc0l5x68e7e
+  SecurityGroupId: sg-t4n8prl64zugz5i1yebu
+  DefaultRoute: eth0
+DataSources:
+  - Uri: bmcpfs://cpfs-07001v48jdw7tt8jhw0df-vpc-1xh1pi.ap-southeast-1.cpfs.aliyuncs.com/
+    MountPath: /cpfs/
+  - DataSourceId: d-1behmxymo477ld4v78
+    MountPath: /oss/lerobot_epic/
+UserCommand: |
+  bash -c '
+  set -uo pipefail
+  echo "=== HOST $(hostname) DATE $(date) ==="
+  echo
+  echo "=== /oss/lerobot_epic/ TOP ==="
+  ls -la /oss/lerobot_epic/ 2>&1 | head -20
+  echo
+  echo "=== meta/info.json ==="
+  cat /oss/lerobot_epic/meta/info.json 2>/dev/null | python -c "import sys, json; d=json.load(sys.stdin); print(json.dumps({k:v for k,v in d.items() if k in [\"codebase_version\",\"total_episodes\",\"total_frames\",\"fps\",\"chunks\",\"data_path\",\"video_path\"]}, indent=2))" 2>&1 | head
+  echo
+  echo "=== data/ tree (chunk vs per-episode?) ==="
+  ls /oss/lerobot_epic/data/ 2>&1 | head -5
+  if [ -d /oss/lerobot_epic/data/chunk-000 ]; then
+      echo "  chunk-000 contents:"
+      ls /oss/lerobot_epic/data/chunk-000/ 2>&1 | head -3
+      echo "  chunk-NNN count:"
+      ls /oss/lerobot_epic/data/ 2>&1 | grep -c "^chunk-" || echo "0"
+  fi
+  echo
+  echo "=== videos/ tree ==="
+  ls /oss/lerobot_epic/videos/ 2>&1 | head -5
+  echo
+  echo "=== file count summary ==="
+  find /oss/lerobot_epic/ -maxdepth 4 -name "*.parquet" 2>/dev/null | head -5
+  echo "  parquet count: $(find /oss/lerobot_epic/ -name '*.parquet' 2>/dev/null | wc -l)"
+  echo "  mp4 count:     $(find /oss/lerobot_epic/ -name '*.mp4' 2>/dev/null | wc -l)"
+  echo
+  echo "=== compare with cpfs equivalent if present ==="
+  for path in /cpfs/egoscale/processed/lerobotv3_hf/lerobot_epic /cpfs/egoscale/processed/lerobot/lerobot_epic; do
+      if [ -d "$path" ]; then
+          echo "  $path total parquet: $(find $path -name '*.parquet' 2>/dev/null | wc -l)"
+      else
+          echo "  $path: not present"
+      fi
+  done
+  echo
+  echo "=== DONE ==="
+  '

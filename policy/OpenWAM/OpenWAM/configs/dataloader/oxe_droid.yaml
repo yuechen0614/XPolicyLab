@@ -1,0 +1,140 @@
+type: oxe_droid
+
+# ── Dataset root ────────────────────────────────────────────────────────────
+# Re-converted DROID LeRobot v3 bucket. 152,986 episodes / 46,259,014 frames /
+# 43,026 tasks at 10 fps, robot_type=franka_robotiq. Two video keys:
+# observation.images.primary (head) + observation.images.wrist.
+#
+# Exterior viewpoints are EPISODES here, not columns: episode_name is
+# {base_id}_{camera_view}, so each of the 76,493 real trajectories appears twice
+# (exterior_image_1_left / exterior_image_2_left) with identical action/state and
+# its own `primary` video. Viewpoint coverage is thus already in the episode
+# index — the old two-exterior-column `head_camera_choices` sampling is gone.
+# A future train/val split must partition on base_id, not episode_index, or the
+# same trajectory lands on both sides (info.json declares train-only today).
+#
+# Sources (rigid ARM-SIDE endpoint; NOT the task-TCP or delta columns):
+#   * state pose = other_information.observation_gripper_pose6d[6] (Euler XYZ)
+#   * state grip = state[6] (closedness; state[:6] is task-TCP and is unused)
+#   * action     = other_information.action_wrist_pose[7] (absolute commanded
+#     arm-side pose + closedness). It leads the achieved gripper-mount pose;
+#     a full-shard lag sweep bottoms out at k≈4 (~0.4 s at 10 fps), so this is a
+#     real forward command rather than a copied observation.
+#
+# This choice aligns DROID with the active mixture's terminal-arm/flange-side
+# convention. The local TCP is a physically different moving control point: a
+# 101,888-row audit found identical rotations but tcp-wrist translation along
+# local +z of 0.143886--0.157181 m, varying with gripper state. It must not share
+# the same 80-D pose slots with Agi's flange or A1/RoboCOIN arm-side endpoints.
+# The top-level action[7] is also unused: it is a clipped delta (measured
+# ±0.1601 m / ±0.3019 rad), not an absolute pose.
+#
+# Raw state/action gripper values use DROID's 0=open, 1=closed convention. The
+# reader and stats scan both apply `1 - raw`, so the shared pre-normalization
+# convention is 0=closed, 1=open (and quantile normalization yields -1/+1).
+#
+# REQUIRED per bucket — write the no-prompt exclusion list, and rerun it after
+# source rows, info.json[data_path], or the complete episodes mapping changes:
+#   python scripts/write_droid_prompt_exclusions.py --dataset-dir <dataset_dir>
+# 426 episodes (157,836 / 46,259,014 windows, 0.341%) have no resolvable prompt
+# from tasks.parquet or any fallback column on ANY row. _resolve_prompt raises
+# on them, and _safe_get's idx+1 retry cannot escape: with window_stride=1 it
+# walks within the same episode, and 336 of the 426 are longer than the 64-retry
+# budget. Without meta/excluded_episodes.json a shuffled 16-worker loader dies
+# at ~sample 264 (worker death -> rank-0 early EOF -> DDP deadlock).
+dataset_dir: /mnt/data/wangyuran/pretrain_dataset/Droid
+
+# ── Window / stride ─────────────────────────────────────────────────────────
+# NOTE: this bucket is 10 fps (the previous DROID conversion was 15). num_frames
+# is in RAW frames, so a 33-frame window now spans 3.2 s of robot time instead of
+# 2.13 s, and video_stride=4 samples at 2.5 Hz instead of 3.75 Hz. num_frames /
+# video_stride are kept as-is because num_video_frames=9 satisfies the Wan VAE
+# contract ((num_video_frames - 1) % 4 == 0); retune only alongside the other
+# mixture sources.
+num_frames: 33
+video_stride: 4
+window_stride: 1
+
+# ── Image size ──────────────────────────────────────────────────────────────
+# Source clips are 180H × 320W for both cameras.
+# multiview=true → L-shape canvas (384H×320W):
+#   top    256H × 320W → primary (BILINEAR-stretched 180×320 → 256×320)
+#   bot-L  128H × 160W → wrist   (BILINEAR-stretched 180×320 → 128×160)
+#   bot-R  128H × 160W → BLACK (DROID has no right wrist camera). color_jitter
+#          below runs AFTER the canvas is assembled, so with it enabled this slot
+#          reaches the model as a uniform GREY rather than pure black — still one
+#          flat colour, just not 0. Cosmetic; noted so it isn't read as a bug.
+# multiview=false → single primary view at (height, width).
+height: 384
+width: 320
+
+multiview: true
+
+# ── Train / val split ───────────────────────────────────────────────────────
+split: train
+
+# ── Video augmentation (optional) ─────────────────────────────────────────────
+# color_jitter: load-time color jitter applied by the reader to each clip, with
+# the SAME random factors across all frames (temporal consistency), TRAIN split
+# only. Omit / null / false → disabled (video byte-identical). Provide a dict to
+# enable + set per-channel strengths (hue is a no-op in PIL mode). Strengths
+# match robocoin.yaml so mixture sources share the same augmentation intensity.
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0
+
+# ── Action / proprio normalization ──────────────────────────────────────────
+# Reads {dataset_dir}/meta/eef_stats.json (state + action stacked). Its strict
+# contract records both arm-side source columns, so the former TCP stats fail at
+# construction rather than being silently reused. Regenerate after any change
+# to the source columns, info.json[data_path], the episodes
+# manifest/range mapping, or meta/excluded_episodes.json (including
+# scan_dataset.py emit). The reader verifies both the exclusion set and the
+# resolved data-population digest. Run the prompt-exclusion generator first,
+# then this stats command, before constructing/verify-mixed:
+#   python -m openwam.dataloader.utils.stats_computation.oxe_stats_computation \
+#       --dataset DROID --dataset-dir /mnt/data/wangyuran/pretrain_dataset/Droid
+# All three modes are supported; quantile is the default (robust to outliers
+# across all 4 OXE datasets). See plans/oxe_dataloaders.md §3.4 and
+# openwam.dataloader.utils.stats_computation.oxe_stats_computation for the empirical comparison.
+#   null / "none" → no normalization
+#   "min-max"     → ((x - min) / (max - min) * 2 - 1)
+#   "z-score"     → ((x - mean) / std)
+#   "quantile"    → clip((x - q01) / (q99 - q01) * 2 - 1, -1, 1)  [default]
+normalize_mode: quantile
+
+enable_action_supervision: true
+
+# ── Unified 80-D action space (cross-robot shared head) ──────────────────────
+# unify_action=true scatters this reader's raw 20-D EEF into a shared 80-D
+# vector so heterogeneous robots train one action head. unify_action=false
+# (default) is byte-identical to the pre-unify reader. 80-D semantic layout:
+#   [ 0: 3) left  eef xyz     [ 3: 9) left  eef rot6d   [ 9]    left  gripper
+#   [10:34) left  hand (24)   [34:37) right eef xyz     [37:43) right eef rot6d
+#   [43]    right gripper     [44:68) right hand (24)   [68:80) reserved (12)
+# Map: raw left-arm 0-9 to unified 0-9, raw right-arm 10-19 to 34-43.
+# OXE is single-arm: the real arm lands in the LEFT slots (0-9, valid); the
+# zero-padded right half maps to 34-43 but stays masked out of the loss
+# (LEFT_ARM_DIM_MASK is honored through the scatter).
+# NOTE: enabled so DROID's action head width (80) matches RoboCOIN's in the
+# mixture (MixtureDataset requires all sub-sources to share one action_dim).
+unify_action: true
+unify_action_map: ["0-9", "34-43"]
+
+# ── Data budget (optional) ──────────────────────────────────────────────────
+# total_hours: cap effective post-exclusion footage used for training, in hours.
+#   - null / unset (default) → use the full dataset (no subsampling).
+#   - positive float (e.g. 200.0) → subsample episodes so the total sampleable
+#     duration is ~total_hours (seeded by project.seed, reproducible). When the
+#     target exceeds the dataset's actual hours (~1285h across both exterior
+#     views, i.e. ~642h of distinct trajectories), the full dataset is used.
+#     NOTE: subsampling is per-episode, so it does not keep a trajectory's two
+#     exterior views together.
+# Declared here (like robocoin/interndata_a1) so the mixture override path
+# ``dataloader.datasets.oxe_droid.total_hours=...`` works without ``+``.
+# The uncapped post-exclusion population has 46,101,178 valid raw frames
+# (17.495393% of the Agi/RoboCOIN/DROID remainder). Its global 6.998157%
+# allocation is 36,253,929 frames = 1007.053583333333 h at 10 fps.
+total_hours: 1007.053583333333

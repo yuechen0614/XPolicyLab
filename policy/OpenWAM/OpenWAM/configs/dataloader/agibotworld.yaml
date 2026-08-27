@@ -1,0 +1,138 @@
+type: agibotworld
+
+# ── Dataset root ────────────────────────────────────────────────────────────
+# Root directory containing the AgiBotWorld-Beta datasets (LeRobot v3 format):
+# 211 task buckets in the current drop, robot_type g2a, fps 15. Each subdirectory has meta/info.json,
+# data/, videos/, meta/tasks.parquet, meta/stats.json. The reader auto-discovers
+# all sub-datasets and wraps them in a MultiAgiBotWorldDataset with binary-search
+# dispatch.
+dataset_dir: /mnt/data/wangyuran/pretrain_dataset/AgiBotWorld-Beta
+
+# ── Window / stride ─────────────────────────────────────────────────────────
+# num_frames + video_stride match RoboCOIN / EgoDex / RoboTwin so mixture
+# batches collate without per-source resize.
+# 33 frames, stride 4 → 9 video frames per sample.
+# Constraint: (num_frames - 1) % video_stride == 0
+#             (num_video_frames - 1) % 4 == 0  (Wan VAE temporal axis)
+num_frames: 33
+video_stride: 4
+window_stride: 1
+
+# ── Segment-boundary cleanup ────────────────────────────────────────────────
+# Uses segment_flag / segment_delta fields injected into AgiBotWorld-Beta:
+#   flag=0: keep full segment
+#   flag=1: skip the leading static prefix before the true motion start
+#   flag=2: skip the trailing static suffix after the true motion end
+#   flag=3: drop the mostly/no-motion segment entirely
+use_segment_annotations: true
+
+# Drop an episode outright when the trim above would remove AT LEAST this fraction
+# of it (0.7 → keeping under 30% of the frames is not worth training on).
+# null / unset → keep every trimmed episode.
+# Measured on AgiBotWorld-Beta (2026-08, 928,722 eps / 2281.08 h after trimming):
+# the trimmed fraction is p50 0.057, p90 0.157, p99 0.389, max 0.897 — so this is
+# a guard against annotation drift, not a material filter:
+#   0.7 → drops     47 eps (0.06 h)      0.5 → drops    452 eps (0.75 h)
+# It does NOT catch short-but-clean episodes; 25,309 episodes are under 33 frames
+# after trimming and every window they yield is padded.
+segment_max_trim_ratio: 0.7
+
+# ── Image size ──────────────────────────────────────────────────────────────
+# multiview=true → L-shape canvas: top 256H×320W (head cam) +
+#   bottom-left 128H×160W (left wrist) + bottom-right 128H×160W (right wrist).
+#   height MUST be 384 and width MUST be 320.
+# multiview=false → single head camera at (height, width).
+height: 384
+width: 320
+
+# ── Multiview ───────────────────────────────────────────────────────────────
+# Cameras are fixed across every bucket:
+#   head        = observation.images.head
+#   left wrist  = observation.images.hand_left
+#   right wrist = observation.images.hand_right
+multiview: true
+
+# ── Train / val split ───────────────────────────────────────────────────────
+# Honors info.json["splits"][split]; otherwise split=train returns the whole
+# eps_df. val is not used in pretraining.
+split: train
+
+# ── Pose-frame contract ────────────────────────────────────────────────────
+# action.ee_base / observation.state.ee_base are robot-base poses of the
+# axis-7 arm flange (official Beta schema; independently reproduced by FK), not
+# a gripper-center/task TCP. The release does not provide a reliable per-bucket
+# flange->TCP calibration, and dexterous hands have no single universal TCP, so
+# this flange field anchors the active mixture's terminal-arm-side convention.
+
+# ── Video augmentation (optional) ─────────────────────────────────────────────
+# Load-time color jitter, SAME random factors across a clip's frames (temporal
+# consistency), TRAIN split only. Omit / null / false → disabled.
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0
+
+# ── Action normalization ────────────────────────────────────────────────────
+# When set, the UNIFIED <dataset_root>/meta/stats_g2a.json is loaded — one flavor-aware
+# stats set pooled across all buckets (AgiBotWorld is a single embodiment; like
+# RoboCOIN's per-robot-type stats, the same physical action normalizes identically
+# everywhere). action and state get SEPARATE stats; rot6d dims identity-pinned.
+# Gripper contract BEFORE normalization is canonical aperture fraction:
+#   0 = fully closed, 1 = fully open.
+# The reader converts source action with (1-x), and converts the source state
+# closing-actuator position using calibrated endpoints 0.035 m=open / 0.125 m=closed:
+#   clip((0.125 - state) / (0.125 - 0.035), 0, 1).
+# stats_g2a.json records this structured contract and is rejected if stale.
+#   null / "none" → no normalization (raw pass-through)
+#   "min-max"     → ((x - min) / (max - min) * 2 - 1)
+#   "z-score"     → ((x - mean) / std)
+#   "quantile"    → clip((x - q01) / (q99 - q01) * 2 - 1, -1, 1)
+# All modes are valid off stats_g2a.json: mean/std/min/max are exact, q01/q99 are an
+# approximate pooled estimate (merged per-bucket reservoirs — good to ~1e-3, not exact).
+# Construction RAISES at startup if the file is missing — generate it once:
+#   python -m openwam.dataloader.utils.stats_computation.agibotworld_stats_computation \
+#       --dataset_dir /mnt/data/wangyuran/pretrain_dataset/AgiBotWorld-Beta \
+#       --segment-max-trim-ratio 0.7
+normalize_mode: quantile
+
+# ── Action / proprio supervision toggle ─────────────────────────────────────
+# true  → normal action + proprio supervision (default).
+# false → action_mask / proprio_mask all-False (video-only auxiliary source).
+enable_action_supervision: true
+
+# ── Unified 80-D action space (cross-robot shared head) ──────────────────────
+# unify_action=true scatters this reader's raw action/proprio into a shared 80-D
+# vector so heterogeneous robots train one action head; the per-dim mask keeps
+# unmapped dims out of the loss. 80-D semantic layout:
+#   [ 0: 3) left  eef xyz     [ 3: 9) left  eef rot6d   [ 9]    left  gripper
+#   [10:34) left  hand (24)   [34:37) right eef xyz     [37:43) right eef rot6d
+#   [43]    right gripper     [44:68) right hand (24)   [68] move x  [69] move y
+#   [70]    move yaw          [71:80) reserved (9)
+#
+# The reader BUILDS THE MAP PER BUCKET IN CODE (the map below is informational /
+# ignored — it varies per bucket, so a single yaml value cannot serve all):
+#   Grippered: raw EEF(20) → left-arm 0-9, right-arm 10-19 → 34-43. Grip in 9 / 43.
+#   Dexterous-hand (see _DEX_BUCKET_IDS in agibotworld.py): raw [pose(18), fingers(12)]
+#     → pose 0-8 / 34-42, the 6+6 finger joints (action.dex / observation.state.dex)
+#     → hand slots 10-15 / 44-49 (front-aligned); grip slots 9/43 + hand tails masked.
+#   Base movement (robot_velocity [x, y≡0, yaw]) → x/yaw into move slots 68 / 70 (slot
+#     69 = y stays empty; the differential-drive base has no lateral velocity). Action
+#     and state are probed independently: a command-only moving bucket keeps action
+#     68/70 valid while its all-zero proprio 68/70 are masked (and vice versa).
+# With unify_action=false these buckets fall back to the standard 20-D EEF (no
+# movement); dex buckets zero-fill + mask the grip slots (9/19).
+#
+# NOTE: turning this on makes action_dim 80 — in a mixture every other source's
+# head must also be 80 (set their unify_action=true too).
+unify_action: true
+
+# ── Data budget (optional) ──────────────────────────────────────────────────
+# total_hours: cap effective post-segment-trim footage, measured in hours.
+#   - null / unset (default) → use the full dataset (no subsampling).
+#   - positive float → subsample episodes across all buckets (water-filling)
+#     so total sampleable duration is ~total_hours. Seeded by project.seed.
+# The uncapped filtered population has 123,175,420 valid raw frames
+# (46.745061% of the Agi/RoboCOIN/DROID remainder). Its global 18.698024%
+# allocation is 96,865,050 frames = 1793.797222222222 h at 15 fps.
+total_hours: 1793.797222222222

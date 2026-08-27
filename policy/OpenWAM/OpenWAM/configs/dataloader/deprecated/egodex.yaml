@@ -1,0 +1,119 @@
+type: egodex
+# ── Dataset root ────────────────────────────────────────────────────────────
+# `dataset_dir` can point at either:
+#   1. A single per-task bucket (a directory that directly contains
+#      `meta/info.json`), or
+#   2. A root directory whose immediate subdirs are 118 per-task buckets
+#      (each with their own `meta/info.json`).
+# Mode (2) is the production path: `EgoDexDataset.from_config` discovers
+# all sub-buckets and wraps them in a `MultiBucketEgoDexDataset`. No per-bucket
+# yaml entries needed.
+#
+# Source-of-truth conversion output is on remote CPFS:
+#   /mnt/data/wangyuran/EgoDex/   (118 sub-tasks)
+# When training reads off OSS, sync via:
+#   ossutil cp -r --update <local> oss://worldmodel/lerobot3/EgoDex/
+# and switch dataset_dir to /oss/worldmodel/lerobot3/EgoDex.
+dataset_dir: /mnt/data/wangyuran/EgoDex
+
+# ── Window / stride ─────────────────────────────────────────────────────────
+# num_frames + video_stride match RoboCOIN / RoboTwin so mixture batches
+# collate without per-source resize. (33 frames, stride 4 → 9 video frames per sample.)
+num_frames: 33
+video_stride: 4
+window_stride: 1
+
+# ── Image size ──────────────────────────────────────────────────────────────
+# 1920x1080 source frames are resized down.
+# When multiview=false: output is (height, width).
+# When multiview=true: height MUST be 384 and width MUST be 320 — the
+# L-shape canvas is split top 256H + bottom 128H, with bottom row halved
+# 160W + 160W. Keep aligned with other sub-datasets in mixture.yaml.
+height: 384
+width: 320
+
+# ── Camera ──────────────────────────────────────────────────────────────────
+# EgoDex is single-camera (head-mounted ego view). target_camera names the
+# parquet column for the ego mp4.
+target_camera: observation.images.ego
+
+# ── Multiview ──────────────────────────────────────────────────────────────
+# multiview: false → single ego camera at (height, width). Default for
+#                    standalone EgoDex training.
+# multiview: true  → L-shape canvas at (384, 320):
+#     top    256H × 320W → ego camera (BILINEAR-stretched to slot)
+#     bot-L  128H × 160W → BLACK (EgoDex has no left wrist camera)
+#     bot-R  128H × 160W → BLACK (EgoDex has no right wrist camera)
+# camera_layout is a 3-element list: [top, bot-left, bot-right]. The two
+# missing-wrist sentinel names ("__missing_left__", "__missing_right__")
+# simply don't appear in the per-frame frames_by_camera dict that the
+# reader passes to assemble_multiview_layout, so those slots stay black.
+multiview: true
+camera_layout: [observation.images.ego, __missing_left__, __missing_right__]
+
+# ── Train / val split ───────────────────────────────────────────────────────
+# When info.json carries an explicit `splits` field (the full conversion does:
+# train = part1..5+extra, val = test) the reader honours it. Otherwise
+# split=train returns the entire eps_df; val is not used in pretraining.
+split: train
+# seed comes from project.seed in train.yaml (injected at launch); the
+# Python ctor falls back to 42 if neither is supplied.
+
+# ── Video augmentation ──────────────────────────────────────────────────────
+# color_jitter: load-time color jitter applied by the reader to each clip, with
+# the SAME random factors across all frames (temporal consistency), TRAIN split
+# only. Omit / null / false → disabled (video byte-identical). Provide a dict
+# to enable + set per-channel strengths (hue is a no-op in PIL mode).
+# NOTE: jitter runs AFTER the L-shape canvas is assembled, so a contrast
+# factor < 1 lifts the black wrist slots slightly above pure black (PIL
+# Contrast blends toward the frame's mean gray). Accepted — matches the
+# robocoin reader's behaviour for missing-wrist buckets.
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0
+
+# ── Unified action space ────────────────────────────────────────────────────
+# unify_action=true widens the emitted action/proprio to the shared 80-D
+# unified space (UNIFY_DIM) so EgoDex batches collate with the other mixture
+# sources whose head is 80-D (robocoin sets unify_action=true too). EgoDex's
+# action/proprio payloads stay all-zero with all-False masks (video-only
+# supervision — see Notes below), so no unify_action_map is needed: the
+# identity map is used and every dim remains masked out of the loss.
+unify_action: true
+
+# ── Data budget (optional) ──────────────────────────────────────────────────
+# total_hours: cap raw video footage used for training, measured in hours.
+#   - null / unset (default)  → use the full dataset (current behaviour,
+#     no subsampling — the budget path is byte-identical to the pre-budget
+#     reader, zero performance / behaviour overhead).
+#   - positive float (e.g. 300.0) → subsample episodes across all
+#     buckets so the total raw video duration is ~total_hours. Allocation
+#     uses water-filling: each bucket starts with total_hours / n_buckets,
+#     undersized buckets keep all their data, remaining budget is
+#     redistributed equally among the rest.
+# Subsampling is seeded by project.seed (reproducible across runs). When
+# the target exceeds the dataset's actual hours, the full dataset is used
+# and a warning is logged.
+total_hours: null
+
+# ── Notes on what this reader does NOT do ───────────────────────────────────
+#  * Action loss is intentionally disabled. The reader emits
+#      action       = zeros(T-1, 80)   (80 = unified dim; raw 20-D pre-scatter)
+#      action_mask  = zeros(T-1, 80, dtype=bool)
+#    The training pipeline computes `action_is_pad = ~action_mask` and skips
+#    the action term for every EgoDex sample. Only video / image-prediction
+#    loss is supervised.
+#  * Proprio is forced to zeros(1, 80) with proprio_mask=zeros(1, 80, bool).
+#    EgoDex's raw observation.state is a 24-D camera-frame double-wrist pose,
+#    which cannot be aligned with the robot base-frame 20-D EEF schema used by
+#    the mixture's other readers. The model layer consumes per-sample
+#    proprio_mask in `_append_proprio_context_token` and isolates EgoDex
+#    samples from the shared proprio_encoder gradient updates. The 24->20 EEF
+#    conversion path has been removed from the reader (no `emit_real_proprio`
+#    knob); rollback goes through `git revert`.
+#  * No normalization (matches the default behaviour of the robocoin
+#    reader).
+#  * No multiview / camera_layout / action_format / quat_convention —
+#    EgoDex schema is fixed by conversion.

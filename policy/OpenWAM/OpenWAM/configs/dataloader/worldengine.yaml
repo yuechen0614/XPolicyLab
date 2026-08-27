@@ -1,0 +1,128 @@
+type: worldengine
+# ── Dataset root ────────────────────────────────────────────────────────────
+# WorldEngine is a SHARDED LeRobot v3 root: 50 standalone sub-datasets
+# (shard_000 … shard_049), each with its own meta/ + data/ + videos/ tree and
+# meta/info.json, robot_type "ego_hand". There is NO meta/info.json at the root,
+# so `from_config` takes the shared multibucket branch: one
+# WorldEngineDataset per shard, aggregated by MultiBucketWorldEngineDataset.
+# No per-shard yaml entries are needed — the shards are discovered by scanning
+# the root for subdirs containing meta/info.json.
+#
+# Drop size (measured 2026-08-01): 71,567 episodes, ~744.9M frames @ 30 fps
+# (~6,897 h of raw ego footage), 3,006 tasks. Episodes are WHOLE ~6-minute
+# recordings (median 11,150 frames ≈ 372 s), not the atomic 0.5–4 s clips of the
+# older /mnt/data/wangyuran/WorldEngine drop.
+dataset_dir: /mnt/data/wangyuran/pretrain_dataset/WorldEngine
+
+# ── Window / stride ─────────────────────────────────────────────────────────
+# num_frames + video_stride match the active mixture sources so batches collate
+# without per-source resize. (33 frames, stride 4 → 9 video
+# frames per sample.)
+num_frames: 33
+video_stride: 4
+window_stride: 1
+
+# ── Image size ──────────────────────────────────────────────────────────────
+# Source frames are 720x1280 (h264); every frame is force-resized into its
+# canvas slot. When multiview=true: height MUST be 384 and width MUST be 320 —
+# the L-shape canvas is top 256H + bottom 128H, bottom row halved 160W + 160W.
+# Keep aligned with the other sub-datasets in mixture.yaml.
+height: 384
+width: 320
+
+# ── Camera ──────────────────────────────────────────────────────────────────
+# Every shard ships TWO ego views (observation.images.ego and
+# observation.images.ego_right). For canvas consistency with the ego-hand family
+# and clean mixture collation this reader renders ONLY the primary ego view;
+# ego_right is intentionally unused (a known follow-up).
+target_camera: observation.images.ego
+
+# ── Multiview ───────────────────────────────────────────────────────────────
+# multiview: true → L-shape canvas at (384, 320):
+#     top    256H × 320W → ego camera (BILINEAR-stretched to slot)
+#     bot-L  128H × 160W → BLACK (no left wrist camera)
+#     bot-R  128H × 160W → BLACK (no right wrist camera)
+# The two "__missing_*__" sentinel names simply don't appear in the per-frame
+# frames_by_camera dict, so those slots stay black — byte-identical canvas to
+# the shared L-shape canvas contract.
+multiview: true
+camera_layout: [observation.images.ego, __missing_left__, __missing_right__]
+
+# ── Train / val split ───────────────────────────────────────────────────────
+# Each shard's info.json declares splits.train = "0:<n_episodes>" (all of it);
+# the reader honours it per shard. Pretraining-only: val is empty (no val
+# partition declared in any shard).
+split: train
+# seed comes from project.seed in train.yaml (injected at launch); ctor default 42.
+# In multibucket mode the seed also drives the per-bucket total_hours subsample
+# (base_seed + i*7919).
+
+# ── Video augmentation ──────────────────────────────────────────────────────
+# Load-time color jitter with the SAME random factors across a clip's frames
+# (temporal consistency), TRAIN split only. Omit / null / false → disabled.
+# NOTE: jitter runs AFTER the L-shape canvas is assembled, so a contrast factor
+# < 1 lifts the black wrist slots slightly above pure black — accepted, matches
+# the standard missing-wrist-slot behaviour.
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0
+
+# ── Unified action space ────────────────────────────────────────────────────
+# unify_action=true widens the emitted action/proprio to the shared 80-D unified
+# space (UNIFY_DIM) so WorldEngine batches collate with the other mixture sources
+# whose head is 80-D. WorldEngine's action/proprio stay all-zero with all-False
+# masks (video-only supervision — no robot action, no materialized action
+# column), so no unify_action_map is needed: the identity map is used and every
+# dim remains masked out of the loss.
+unify_action: true
+
+# ── Data budget ─────────────────────────────────────────────────────────────
+# total_hours: approximate footage target in hours; a positive float is
+# water-filled across the 50 shards and subsamples whole prompt-valid episodes
+# within each (seeded by project.seed), so the realized total can be slightly
+# above the target. null → use the full dataset.
+#
+# Frame-budget allocation: WorldEngine receives 30% of the fixed 518,049,648-
+# frame budget, i.e. 155,414,894 frames = 1439.026796296296 h at 30 fps. This
+# is below the requested 3000 h WorldEngine calculation cap.
+total_hours: 1439.026796296296
+
+# ── Load-time prompt-consistency probe ──────────────────────────────────────
+# Max data shards probed per shard-bucket. null / unset → the reader default 0 =
+# EXHAUSTIVE: every episode's per-frame task_index is verified against
+# meta/tasks.parquet before training starts, because a diverged episode raises on
+# all ~11k of its windows and the base reader's 64-retry budget cannot skip past
+# it — the DataLoader worker dies mid-run. Measured cost of the 50-shard root
+# build, dominated by page-cache state: ~55–60 s cold, ~15 s warm (vs ~1 s warm
+# at a cap of 8). A positive value caps the probe at that many evenly spread
+# shards per bucket — 8 covers only ~1.2% of episodes, enough for a whole-dataset
+# divergence but not one confined to a single re-converted chunk. Trade coverage
+# for launch speed only deliberately, e.g. on many-rank nodes where concurrent
+# ranks multiply the IO.
+prompt_check_max_shards: null
+
+# ── Notes on what this reader does ──────────────────────────────────────────
+#  * Prompt: meta/tasks.parquet is per-shard (task_index restarts at 0 in every
+#    shard; multibucket mode keeps each lookup inside its own shard). The text is
+#    ALREADY plain English in this drop — there is no bilingual "中文:…英文:…"
+#    wrapper to split. It is stored in the parquet's index column, which arrives
+#    as a plain column named `__index_level_0__` because the file carries no
+#    pandas metadata; the reader also accepts a `task` column or a restored
+#    string index. Every string passes the shared non-Latin-script guard, and an
+#    episode whose task text is blank / "null" / non-Latin is dropped at init
+#    (0 of 3,006 tasks are rejected at this drop).
+#  * Action loss is intentionally disabled. The reader emits
+#      action = zeros(T-1, 80), action_mask = zeros(T-1, 80, bool),
+#      proprio = zeros(1, 80),  proprio_mask = zeros(1, 80, bool).
+#    WorldEngine's per-frame payload is human MANO hand pose (not a robot action)
+#    and has no materialized action column, so only video / image-prediction
+#    loss is supervised (same contract as Ego4D / EgoDex).
+#  * No normalization: WorldEngine's action/proprio are masked video-only zeros;
+#    the robot sources normalize inside their own readers.
+#  * Bad-episode exclusion: per-shard meta/excluded_episodes.json (written by
+#    scripts/scan_dataset.py) lists {"episode_indices": [...]} to skip. None ship
+#    with this drop. Note that episodes here back ~11k windows each, far above
+#    the base reader's 64-retry budget, so a systematically bad episode must be
+#    excluded rather than retried around.

@@ -1,0 +1,44 @@
+type: libero
+
+# Canonical standalone LeRobot v3 dataset. Both streams are already row-aligned
+# in the same physical EEF10 schema:
+#   observation.state = achieved [xyz3, rot6d6, gripper_open_scale1]
+#   action            = absolute OSC goal [xyz3, rot6d6, gripper_open_scale1]
+dataset_dir: /mnt/data/wangyuran/libero
+action_mode: eef
+gripper_convention: minus1_closed_plus1_open
+
+# Normalize raw EEF10, then scatter into the canonical left-arm slots 0..9.
+unify_action: true
+unify_action_map: ["0-9"]
+normalize_mode: min-max
+
+head_camera_priority:
+  - observation.images.image
+wrist_camera_priority:
+  - observation.images.wrist_image
+  - observation.images.image2
+prompt_columns:
+  - language_instruction
+  - task
+  - prompt
+
+num_frames: 33
+video_stride: 4
+window_stride: 1
+height: 384
+width: 320
+multiview: true
+
+split: train
+enable_action_supervision: true
+
+# Train-only color augmentation. One shared set of factors is sampled per clip
+# and applied after the head/wrist views have been assembled, preserving
+# temporal consistency. Structurally missing camera slots are masked out and
+# remain black. Val/deploy inputs are unchanged. Set to null or false to disable.
+color_jitter:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.0
